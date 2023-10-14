@@ -1,5 +1,6 @@
 use ini::Ini;
 use git2::{Repository, Oid};
+use last_git_commit::LastGitCommit;
 use tempdir::{self, TempDir};
 
 fn get_repo_root() -> Option<String> {
@@ -51,10 +52,10 @@ fn get_file_from_remote<'a>(
     temp_dir: &String,
     file_id: String,
     git_sha: &Option<String>
-) -> String {
+) -> Result<String, String> {
     let temp_repo = match Repository::clone(&remote_uri, temp_dir) {
         Ok(r) => r,
-        Err(e) => panic!("Failed to clone '{}': {}", remote_uri, e)
+        Err(e) => {return Err(format!("Failed to clone '{}': {}", remote_uri, e))}
     };
     let temp_dir_path = std::path::Path::new(&temp_dir);
 
@@ -63,25 +64,34 @@ fn get_file_from_remote<'a>(
     if git_sha.is_some() && git_sha.clone().unwrap().to_uppercase() != "HEAD" {
         let object_id = match Oid::from_str(&git_sha.clone().unwrap()) {
             Ok(o) => o,
-            Err(e) => panic!("{}", e)
+            Err(e) => {return Err(format!("{}", e))}
         };
-        match temp_repo.set_head_detached(object_id) {
+        let object = match temp_repo.find_commit(object_id) {
+            Ok(o) => o,
+            Err(_) => {return Err(format!("Could not map commit '{}' to object", git_sha.clone().unwrap()))}
+        };
+        match temp_repo.checkout_tree(&object.clone().into_object(), None) {
             Ok(_) => (),
-            Err(e) => panic!("Failed to create branch from commit '{}' for file '{}': {}", git_sha.clone().unwrap(), local_file_path, e)
+            Err(_) => {return Err(format!("Could not checkout tree for commit '{}'", git_sha.clone().unwrap()))}
+        };
+        match temp_repo.set_head_detached(object.id()) {
+            Ok(_) => (),
+            Err(e) => {return Err(format!("Failed to create branch from commit '{}' for file '{}': {}", git_sha.clone().unwrap(), local_file_path, e))}
         };
         actual_sha = git_sha.clone().unwrap();
     }
     else {
-        actual_sha = match temp_repo.head() {
-            Ok(h) => h.name().unwrap().clone().to_string(),
-            Err(e) => panic!("Failed to retrieve reference: {}", e)
+        let latest_commit = match LastGitCommit::new().build() {
+            Ok(lgc) => lgc,
+            Err(e) => {return Err(format!("Could not retrieve latest commit: {}", e))}
         };
+        actual_sha = latest_commit.id().long();
     }
     match std::fs::copy(&temp_dir_path.join(remote_file_path), local_file_path) {
         Ok(_) => (),
-        Err(e) => panic!("Failed to copy file '{}': {}", file_id, e)
+        Err(e) => {return Err(format!("Failed to copy file '{}': {}", file_id, e))} 
     };
-    actual_sha
+    Ok(actual_sha)
 }
 
 
@@ -112,7 +122,7 @@ pub fn add_entry(
         None => {return Err(format!("Failed to get temporary directory path as string"))}
     };
 
-    let actual_sha = get_file_from_remote(remote_uri, remote_file_path, local_file_path, &temp_dir_str, file_id, git_sha);
+    let actual_sha = get_file_from_remote(remote_uri, remote_file_path, local_file_path, &temp_dir_str, file_id, git_sha)?;
 
     match temp_dir.close() {
         Ok(_) => (),
@@ -157,7 +167,10 @@ pub fn remove_entry(local_file_path: &String) -> Result<(), String> {
 }
 
 
+#[cfg(test)]
 mod test {
+    use super::*;
+
     #[test]
     fn test_add_remove() -> () {
         let remote_url = "https://github.com/Railway-Op-Sim/railostools.git".to_string();
