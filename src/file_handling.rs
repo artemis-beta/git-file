@@ -61,6 +61,8 @@ fn get_file_from_remote<'a>(
 
     let actual_sha;
 
+    println!("{:?} {:?}", git_sha, git_sha.is_some());
+
     if git_sha.is_some() && git_sha.clone().unwrap().to_uppercase() != "HEAD" {
         let object_id = match Oid::from_str(&git_sha.clone().unwrap()) {
             Ok(o) => o,
@@ -101,6 +103,9 @@ pub fn add_entry(
     git_sha: &Option<String>,
     local_file_path: &String
 ) -> Result<(),String> {
+    if std::path::Path::new(&local_file_path).exists() {
+        return Err(format!("Cannot add entry, file '{}' already exists", local_file_path));
+    }
     let config_file = match get_current_repo_config() {
         Some(c) => c,
         None => {return Err(format!("Failed to retrieve git-file configuration"))}
@@ -109,6 +114,10 @@ pub fn add_entry(
         Ok(f) => f,
         Err(_) => Ini::new()
     };
+
+    if ini_config.section(Some(local_file_path)).is_some() {
+        return Err(format!("File '{}' is already tracked", local_file_path));
+    }
 
     let file_id = format!("{}{}@{}", remote_uri, local_file_path, match &git_sha {Some(o) => o, None => "HEAD"});
 
@@ -154,6 +163,10 @@ pub fn remove_entry(local_file_path: &String) -> Result<(), String> {
         Some(_) => (),
         None => {return Err(format!("File '{}' is not tracked by git-file", local_file_path));}
     };
+
+    if std::path::Path::new(&local_file_path).exists() {
+        return Ok(());
+    }
 
     match std::fs::remove_file(local_file_path) {
         Ok(_) => (),
