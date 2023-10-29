@@ -6,7 +6,8 @@ mod file_handling;
 #[derive(clap::Subcommand)]
 enum SubCommand {
     Add {remote: String, remote_file_path: String, local_file_path: Option<String>, git_sha: Option<String>},
-    Rm {local_file_path: String}
+    Rm {local_file_path: String},
+    Pull {local_file_path: Option<String>}
 }
 
 #[derive(Parser)]
@@ -60,6 +61,12 @@ fn main() {
         SubCommand::Rm { local_file_path } => {
             match file_handling::remove_entry(&local_file_path) {
                 Ok(_) => info(format!("Removed file '{}'", local_file_path)),
+                Err(e) => error(format!("{}", e))
+            }
+        },
+        SubCommand::Pull { local_file_path } => {
+            match file_handling::pull(&local_file_path) {
+                Ok(_) => info(format!("Entries successfully updated")),
                 Err(e) => error(format!("{}", e))
             }
         }

@@ -1,6 +1,5 @@
 use ini::Ini;
 use git2::{Repository, Oid};
-use last_git_commit::LastGitCommit;
 use tempdir::{self, TempDir};
 
 fn get_repo_root() -> Option<String> {
@@ -61,8 +60,6 @@ fn get_file_from_remote<'a>(
 
     let actual_sha;
 
-    println!("{:?} {:?}", git_sha, git_sha.is_some());
-
     if git_sha.is_some() && git_sha.clone().unwrap().to_uppercase() != "HEAD" {
         let object_id = match Oid::from_str(&git_sha.clone().unwrap()) {
             Ok(o) => o,
@@ -83,11 +80,15 @@ fn get_file_from_remote<'a>(
         actual_sha = git_sha.clone().unwrap();
     }
     else {
-        let latest_commit = match LastGitCommit::new().build() {
-            Ok(lgc) => lgc,
-            Err(e) => {return Err(format!("Could not retrieve latest commit: {}", e))}
+        let head = match temp_repo.head() {
+            Ok(r) => r,
+            Err(e) => {return Err(format!("Failed to retrieve head for {}: {}", file_id, e))}
         };
-        actual_sha = latest_commit.id().long();
+        let latest_commit = match head.peel_to_commit() {
+            Ok(l) => l,
+            Err(e) => {return Err(format!("Failed to get head commit for {}: {}", file_id, e))}
+        };
+        actual_sha = latest_commit.id().to_string();
     }
     match std::fs::copy(&temp_dir_path.join(remote_file_path), local_file_path) {
         Ok(_) => (),
@@ -165,13 +166,11 @@ pub fn remove_entry(local_file_path: &String) -> Result<(), String> {
     };
 
     if std::path::Path::new(&local_file_path).exists() {
-        return Ok(());
+        match std::fs::remove_file(local_file_path) {
+            Ok(_) => (),
+            Err(e) => {return Err(format!("Failed to remove local file '{}': {}", local_file_path, e))}
+        };
     }
-
-    match std::fs::remove_file(local_file_path) {
-        Ok(_) => (),
-        Err(e) => {return Err(format!("Failed to remove local file '{}': {}", local_file_path, e))}
-    };
 
     match ini_config.write_to_file(config_file) {
         Ok(_) => Ok(()),
@@ -180,14 +179,119 @@ pub fn remove_entry(local_file_path: &String) -> Result<(), String> {
 }
 
 
+fn pull_entry(local_file: &String) -> Result<(), String> {
+    let config_file = match get_current_repo_config() {
+        Some(c) => c,
+        None => {return Err(format!("Failed to retrieve git-file configuration"))}
+    };
+    let mut ini_config = match Ini::load_from_file(&config_file) {
+        Ok(i) => i,
+        Err(_) => {return Err(format!("Failed to open file '{}'", config_file))}
+    };
+
+    let section = match ini_config.section(Some(local_file.clone())) {
+        Some(s) => s,
+        None => {return Err(format!("Failed to find entry for file '{}'", local_file))}
+    };
+
+    let remote_uri = match section.get("remote") {
+        Some(r) => r,
+        None => {return Err(format!("Failed to find remote URL for file '{}'", local_file))}
+    };
+
+    let remote_file_path = match section.get("file_path") {
+        Some(r) => r,
+        None => {return Err(format!("Failed to find remote file path for entry '{}'", local_file))}
+    };
+
+    let temp_dir = match TempDir::new("git-file") {
+        Ok(d) => d,
+        Err(_) => panic!("Failed to create temporary directory for updating file {}", local_file)
+    };
+
+    let temp_dir_str = match temp_dir.path().to_str() {
+        Some(s) => s.to_string(),
+        None => {return Err(format!("Failed to get temporary directory path as string"))}
+    };
+
+    let file_id = format!("{}{}@{}", remote_uri, local_file, "HEAD".to_string());
+
+    let new_sha = match get_file_from_remote(
+        &remote_uri.to_string(),
+        &remote_file_path.to_string(),
+        &local_file,
+        &temp_dir_str,
+        file_id,
+        &Some("HEAD".to_string())
+    ) {
+        Ok(s) => s,
+        Err(e) => {return Err(e)}
+    };
+
+    ini_config.with_section(Some(local_file.clone()))
+        .set("sha", &new_sha);
+    
+    match ini_config.write_to_file(config_file) {
+        Ok(_) => (),
+        Err(e) => {return Err(format!("Failed to write to configuration file: {}", e))}
+    };
+    
+    match temp_dir.close() {
+        Ok(_) => (),
+        Err(e) => panic!("Failed to close temporary repository directory: {}", e)
+    }
+    Ok(())
+}
+
+
+pub fn pull(local_file: &Option<String>) -> Result<(), String> {
+    if local_file.is_some() {
+        match pull_entry(local_file.as_ref().unwrap()) {
+            Ok(a) => a,
+            Err(e) => {return Err(e)}
+        }
+    };
+
+    let config_file = match get_current_repo_config() {
+        Some(c) => c,
+        None => {return Err(format!("Failed to retrieve git-file configuration"))}
+    };
+    let ini_config = match Ini::load_from_file(&config_file) {
+        Ok(f) => f,
+        Err(_) => Ini::new()
+    };
+
+    for (section_name, _) in ini_config.iter() {
+        match section_name {
+            Some(s) => match pull_entry(&s.to_string()) {
+                Ok(a) => a,
+                Err(e) => {return Err(e)}
+            },
+            None => ()
+        };
+    }
+
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod test {
+    use std::fs::*;
     use super::*;
+    use std::env::set_current_dir;
+    use rstest::*;
 
-    #[test]
+    #[rstest]
     fn test_add_remove() -> () {
+        let temp_dir = match TempDir::new("test_dir") {
+            Ok(d) => d,
+            Err(_) => panic!("Failed to test directory")
+        };
+        create_dir_all(format!("{}/{}", temp_dir.path().display(), ".git")).unwrap();
+        set_current_dir(temp_dir.path()).unwrap();
         let remote_url = "https://github.com/Railway-Op-Sim/railostools.git".to_string();
-        let hash = Some("4b4cf9c22413206d6dd9cbe54dd5d6c37ebb3dfe".to_string());
+        let hash = Some("5e10f95394d586b36da35bf5d8776f22c3e12dc7".to_string());
         let remote_path = ".sonarcloud.properties".to_string();
         let local_path = ".sonarcloud.properties".to_string();
 
@@ -198,10 +302,27 @@ mod test {
             Err(e) => panic!("Failed to add entry to file {}: {}", current_repo, e)
         };
         assert!(std::path::Path::new(&local_path).exists());
+        match pull(&Some(local_path.clone())) {
+            Ok(_) => (),
+            Err(e) => panic!("{}", e)
+        };
+        let config_file = match get_current_repo_config() {
+            Some(c) => c,
+            None => panic!("Failed to retrieve git-file configuration")
+        };
+        let ini_config = match Ini::load_from_file(&config_file) {
+            Ok(i) => i,
+            Err(_) =>panic!("Failed to open file '{}'", config_file)
+        };
+        let section = match ini_config.section(Some(local_path.clone())) {
+            Some(s) => s,
+            None => panic!("Failed to retrieved section {}", local_path.clone())
+        };
+        assert_eq!(section.get("sha").unwrap(), "4b4cf9c22413206d6dd9cbe54dd5d6c37ebb3dfe");
         match remove_entry(&local_path) {
             Ok(_) => (),
-            Err(_) => panic!("Failed to remove entry {} from file {}", local_path, current_repo)
-        }
+            Err(e) => panic!("{}", e)
+        };
         assert!(!std::path::Path::new(&local_path).exists());
     }
 }
